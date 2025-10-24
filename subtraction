@@ -1,0 +1,307 @@
+
+# Cargar módulos
+module load R/4.3.3
+
+# Directorios base
+BASE_DIR="
+WORK_DIR=
+mkdir -p "$WORK_DIR" "${WORK_DIR}/results" "${WORK_DIR}/qc" "${WORK_DIR}/objects"
+
+# Script R que implementa Booth et al.
+RSCRIPT="${WORK_DIR}/oxbs_booth_protocol.R"
+
+cat > "$RSCRIPT" << 'EOF'
+#!/usr/bin/env Rscript
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(GenomicRanges)
+library(ggplot2)
+
+# Configuración
+setwd
+dir.create("results", showWarnings = FALSE)
+dir.create("qc", showWarnings = FALSE)
+dir.create("objects", showWarnings = FALSE)
+
+# Definir pares BS/oxBS según Booth et al.
+sample_pairs <- list(
+  "Tg_SA" = list(
+    bs = "../RRBS/sin_ambiente/rrbs_Tg/extract/Tg_val_1_bismark_bt2_pe.CpG_report.txt.gz",
+    oxbs = "../OxRRBS/sin_ambiente/rrbs_Tg-OX/extract/Tg-OX_val_1_bismark_bt2_pe.CpG_report.txt.gz"
+  ),
+  "WT_SA" = list(
+    bs = "../RRBS/sin_ambiente/rrbs_WT/extract/WT_val_1_bismark_bt2_pe.CpG_report.txt.gz", 
+    oxbs = "../OxRRBS/sin_ambiente/rrbs_WT-OX/extract/WT-OX_val_1_bismark_bt2_pe.CpG_report.txt.gz"
+  ),
+  "Tg_AE" = list(
+    bs = "../RRBS/ambiente_enriquecido/rrbs_Tg_AE_Pool_4/extract/Tg_AE_Pool_4_val_1_bismark_bt2_pe.CpG_report.txt.gz",
+    oxbs = "../OxRRBS/ambiente_enriquecido/rrbs_Tg_AE_Pool_4/extract/Tg_AE_Pool_4_val_1_bismark_bt2_pe.CpG_report.txt.gz"
+  ),
+  "WT_AE" = list(
+    bs = "../RRBS/ambiente_enriquecido/rrbs_WT_AE_Pool_3/extract/WT_AE_Pool_3_val_1_bismark_bt2_pe.CpG_report.txt.gz",
+    oxbs = "../OxRRBS/ambiente_enriquecido/rrbs_WT_AE_Pool_3/extract/WT_AE_Pool_3_val_1_bismark_bt2_pe.CpG_report.txt.gz"
+  )
+)
+
+# Función para leer archivos CpG report de Bismark
+read_cpg_report <- function(file_path) {
+  cat("Leyendo:", file_path, "\n")
+
+  if (!file.exists(file_path)) {
+    stop("Archivo no encontrado: ", file_path)
+  }
+
+  # Leer datos (formato: chr, start, strand, count_met, count_unmet, context)
+  data <- read.table(
+    file_path,
+    sep = "\t",
+    header = FALSE,
+    col.names = c("chr", "pos", "strand", "count_met", "count_unmet", "context"),
+    stringsAsFactors = FALSE
+  )
+
+  # Calcular porcentaje y cobertura
+  data <- data %>%
+    mutate(
+      coverage = count_met + count_unmet,
+      methylation_percent = ifelse(coverage > 0, (count_met / coverage) * 100, 0),
+      sample = basename(file_path)
+    )
+
+  cat("  CpGs leídos:", nrow(data), "\n")
+  cat("  Cobertura media:", mean(data$coverage), "\n")
+
+  return(data)
+}
+
+# Función para filtrar por cobertura (≥10 reads en AMBAS técnicas)
+filter_by_coverage <- function(bs_data, oxbs_data, min_coverage = 10) {
+  # Unir por posición genómica
+  merged <- inner_join(
+    bs_data %>% select(chr, pos, strand, count_met_bs = count_met, count_unmet_bs = count_unmet, coverage_bs = coverage),
+    oxbs_data %>% select(chr, pos, strand, count_met_oxbs = count_met, count_unmet_oxbs = count_unmet, coverage_oxbs = coverage),
+    by = c("chr", "pos", "strand")
+  )
+
+  # Filtrar por cobertura mínima
+  filtered <- merged %>%
+    filter(coverage_bs >= min_coverage & coverage_oxbs >= min_coverage)
+
+  cat("CpGs después de filtrar por cobertura ≥", min_coverage, ":", nrow(filtered), "\n")
+  return(filtered)
+}
+
+# Función para test binomial (5mC significativo en oxBS)
+binomial_test_5mc <- function(oxbs_data, conversion_rate = 0.998) {
+  cat("Aplicando test binomial para 5mC...\n")
+
+  results <- oxbs_data %>%
+    rowwise() %>%
+    mutate(
+      p_value_binomial = binom.test(
+        count_met_oxbs,
+        coverage_oxbs,
+        p = 1 - conversion_rate,  # H0: solo error de conversión
+        alternative = "greater"
+      )$p.value
+    ) %>%
+    ungroup()
+
+  # Corrección multiple
+  results <- results %>%
+    mutate(
+      p_adj_binomial = p.adjust(p_value_binomial, method = "BH")
+    )
+
+  # 5mC significativo (p.adj < 0.01 como en Booth et al.)
+  sig_5mc <- results %>% filter(p_adj_binomial < 0.01)
+  cat("CpGs con 5mC significativo:", nrow(sig_5mc), "\n")
+
+  return(list(all_results = results, significant_5mc = sig_5mc))
+}
+
+# Función para Fisher's exact test (5hmC significativo - BS vs oxBS)
+fisher_test_5hmc <- function(merged_data) {
+  cat("Aplicando Fisher's exact test para 5hmC...\n")
+
+  results <- merged_data %>%
+    rowwise() %>%
+    mutate(
+      # Tabla de contingencia para Fisher's test
+      p_value_fisher = fisher.test(
+        matrix(
+          c(count_met_bs, count_unmet_bs, count_met_oxbs, count_unmet_oxbs),
+          nrow = 2,
+          dimnames = list(
+            c("BS", "oxBS"),
+            c("methylated", "unmethylated")
+          )
+        ),
+        alternative = "greater"  # BS > oxBS indica 5hmC
+      )$p.value
+    ) %>%
+    ungroup()
+
+  # Corrección multiple
+  results <- results %>%
+    mutate(
+      p_adj_fisher = p.adjust(p_value_fisher, method = "BH")
+    )
+
+  # 5hmC significativo (p.adj < 0.05 como en Booth et al.)
+  sig_5hmc <- results %>% filter(p_adj_fisher < 0.05 & count_met_bs > count_met_oxbs)
+  cat("CpGs con 5hmC significativo:", nrow(sig_5hmc), "\n")
+
+  return(list(all_results = results, significant_5hmc = sig_5hmc))
+}
+
+# Función para calcular niveles de 5mC y 5hmC
+calculate_hydroxymethylation <- function(merged_data) {
+  results <- merged_data %>%
+    mutate(
+      # Porcentajes
+      percent_5mc_5hmc = (count_met_bs / coverage_bs) * 100,      # BS: 5mC + 5hmC
+      percent_5mc = (count_met_oxbs / coverage_oxbs) * 100,       # oxBS: solo 5mC
+      percent_5hmc = percent_5mc_5hmc - percent_5mc,              # 5hmC por substracción
+
+      # Counts estimados (para análisis posterior)
+      estimated_5hmc_count = pmax(0, count_met_bs - count_met_oxbs),
+      estimated_5hmc_percent = ifelse(coverage_bs > 0, (estimated_5hmc_count / coverage_bs) * 100, 0)
+    )
+
+  return(results)
+}
+
+# Análisis para cada par de muestras
+cat("=== INICIANDO ANÁLISIS OXBS - PROTOCOLO BOOTH ET AL. ===\n\n")
+
+all_results <- list()
+
+for (sample_name in names(sample_pairs)) {
+  cat("\n>>> Procesando:", sample_name, "\n")
+  cat("=========================================\n")
+
+  pair <- sample_pairs[[sample_name]]
+
+  # 1. Leer datos
+  bs_data <- read_cpg_report(pair$bs)
+  oxbs_data <- read_cpg_report(pair$oxbs)
+
+  # 2. Filtrar por cobertura (≥10 reads en ambas)
+  filtered_data <- filter_by_coverage(bs_data, oxbs_data, min_coverage = 10)
+
+  if (nrow(filtered_data) == 0) {
+    cat("  ⚠ No hay CpGs con cobertura suficiente. Saltando...\n")
+    next
+  }
+
+  # 3. Calcular 5mC y 5hmC
+  hydroxymethylation <- calculate_hydroxymethylation(filtered_data)
+
+  # 4. Test binomial para 5mC significativo
+  binomial_results <- binomial_test_5mc(hydroxymethylation)
+
+  # 5. Fisher's test para 5hmC significativo
+  fisher_results <- fisher_test_5hmc(hydroxymethylation)
+
+  # Combinar resultados
+  final_results <- hydroxymethylation %>%
+    left_join(binomial_results$all_results %>% select(chr, pos, strand, p_value_binomial, p_adj_binomial),
+              by = c("chr", "pos", "strand")) %>%
+    left_join(fisher_results$all_results %>% select(chr, pos, strand, p_value_fisher, p_adj_fisher),
+              by = c("chr", "pos", "strand")) %>%
+    mutate(
+      significant_5mc = p_adj_binomial < 0.01,
+      significant_5hmc = p_adj_fisher < 0.05 & count_met_bs > count_met_oxbs,
+      sample = sample_name
+    )
+
+  # Guardar resultados por muestra
+  all_results[[sample_name]] <- final_results
+
+  # Estadísticas
+  cat("\n--- ESTADÍSTICAS", sample_name, "---\n")
+  cat("Total CpGs analizados:", nrow(final_results), "\n")
+  cat("CpGs con 5mC significativo:", sum(final_results$significant_5mc, na.rm = TRUE), "\n")
+  cat("CpGs con 5hmC significativo:", sum(final_results$significant_5hmc, na.rm = TRUE), "\n")
+  cat("5mC medio:", mean(final_results$percent_5mc, na.rm = TRUE), "%\n")
+  cat("5hmC medio:", mean(final_results$percent_5hmc, na.rm = TRUE), "%\n")
+  cat("5hmC máximo:", max(final_results$percent_5hmc, na.rm = TRUE), "%\n")
+
+  # Guardar resultados detallados
+  write.table(
+    final_results,
+    file = paste0("results/", sample_name, "_hydroxymethylation_detailed.tsv"),
+    sep = "\t", quote = FALSE, row.names = FALSE
+  )
+
+  # Guardar solo significativos
+  sig_5hmc <- final_results %>% filter(significant_5hmc)
+  if (nrow(sig_5hmc) > 0) {
+    write.table(
+      sig_5hmc,
+      file = paste0("results/", sample_name, "_significant_5hmc.tsv"),
+      sep = "\t", quote = FALSE, row.names = FALSE
+    )
+  }
+}
+
+# Análisis comparativo entre condiciones
+cat("\n=== ANÁLISIS COMPARATIVO ENTRE CONDICIONES ===\n")
+
+if (length(all_results) > 0) {
+  # Combinar todos los resultados
+  combined_results <- bind_rows(all_results, .id = "sample_id") %>%
+    separate(sample_id, into = c("genotype", "environment"), remove = FALSE)
+
+  # Resumen por condición
+  summary_stats <- combined_results %>%
+    group_by(genotype, environment) %>%
+    summarise(
+      n_cpgs = n(),
+      mean_5mc = mean(percent_5mc, na.rm = TRUE),
+      mean_5hmc = mean(percent_5hmc, na.rm = TRUE),
+      n_sig_5hmc = sum(significant_5hmc, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  print(summary_stats)
+  write.table(summary_stats, "results/summary_statistics_by_condition.tsv",
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  # Gráficos
+  p1 <- ggplot(combined_results, aes(x = genotype, y = percent_5hmc, fill = environment)) +
+    geom_boxplot(alpha = 0.7) +
+    labs(title = "Distribución de 5hmC por Genotipo y Ambiente",
+         y = "5hmC (%)", x = "Genotipo") +
+    theme_minimal()
+
+  p2 <- ggplot(summary_stats, aes(x = genotype, y = n_sig_5hmc, fill = environment)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Número de CpGs con 5hmC Significativo",
+         y = "Número de CpGs", x = "Genotipo") +
+    theme_minimal()
+
+  ggsave("qc/5hmc_distribution.png", p1, width = 8, height = 6)
+  ggsave("qc/significant_5hmc_counts.png", p2, width = 8, height = 6)
+
+  # Guardar objeto completo para análisis posterior
+  saveRDS(combined_results, "objects/all_hydroxymethylation_results.rds")
+}
+
+cat("\n=== ANÁLISIS COMPLETADO ===\n")
+cat("Resultados guardados en:/results/\n")
+cat("Gráficos guardados en: /qc/\n")
+cat("Objetos R guardados en: /objects/\n")
+cat("Fin:", date(), "\n")
+
+# Session info
+writeLines(capture.output(sessionInfo()), "qc/session_info.txt")
+EOF
+
+# Ejecutar análisis
+echo "Ejecutando protocolo Booth et al. para oxBS..."
+cd "$WORK_DIR"
+Rscript "$RSCRIPT" 2>&1 | tee "${WORK_DIR}/oxbs_booth_analysis.log"
