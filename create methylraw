@@ -1,0 +1,126 @@
+library(readr)
+library(methylKit)
+
+WT_SA_significant_5hmc <- read_delim("Galeano/WT_SA_significant_5hmc.tsv",
+delim = "\t", escape_double = FALSE,
+trim_ws = TRUE)
+# Counts estimados de 5hmC
+count_5hmc <- pmax(0, WT_SA_significant_5hmc$count_met_bs - WT_SA_significant_5hmc$count_met_oxbs)
+count_non_5hmc <- WT_SA_significant_5hmc$coverage_bs - count_5hmc
+# Objeto methylRaw para 5hmC
+methyl_5hmc_wt <- data.frame(
+chr = WT_SA_significant_5hmc$chr,
+start = WT_SA_significant_5hmc$pos,
+strand = WT_SA_significant_5hmc$strand,
+coverage = WT_SA_significant_5hmc$coverage_bs,
+numCs = count_5hmc, # 5hmC counts
+numTs = count_non_5hmc # No-5hmC counts
+)
+# Vector de equivalencias
+new.chr.names <- c(
+"NC_005100.4" = "chr1",
+"NC_005101.4" = "chr2",
+"NC_005102.4" = "chr3",
+"NC_005103.4" = "chr4",
+"NC_005104.4" = "chr5",
+"NC_005105.4" = "chr6",
+"NC_005106.4" = "chr7",
+"NC_005107.4" = "chr8",
+"NC_005108.4" = "chr9",
+"NC_005109.4" = "chr10",
+"NC_005110.4" = "chr11",
+"NC_005111.4" = "chr12",
+"NC_005112.4" = "chr13",
+"NC_005113.4" = "chr14",
+"NC_005114.4" = "chr15",
+"NC_005115.4" = "chr16",
+"NC_005116.4" = "chr17",
+"NC_005117.4" = "chr18",
+"NC_005118.4" = "chr19",
+"NC_005119.4" = "chr20",
+"NC_005120.4" = "chrX",
+"NC_024475.1" = "chrY",
+"NC_001665.2" = "chrM"
+)
+# 1. Filtrar filas cuya columna chr empiece por "NC_"
+methyl_filtered_wt <- methyl_5hmc_wt[grep("^NC_", methyl_5hmc_wt$chr), ]
+# 2. Reemplazar los nombres según la tabla
+methyl_filtered_wt$chr <- new.chr.names[methyl_filtered_wt$chr]
+TG_SA_significant_5hmc <- read_delim("Galeano/Tg_SA_significant_5hmc.tsv",
+delim = "\t", escape_double = FALSE,
+trim_ws = TRUE)
+# Counts estimados de 5hmC
+count_5hmc <- pmax(0, TG_SA_significant_5hmc$count_met_bs - TG_SA_significant_5hmc$count_met_oxbs)
+count_non_5hmc <- TG_SA_significant_5hmc$coverage_bs - count_5hmc
+# Objeto methylRaw para 5hmC
+methyl_5hmc_TG <- data.frame(
+chr = TG_SA_significant_5hmc$chr,
+start = TG_SA_significant_5hmc$pos,
+strand = TG_SA_significant_5hmc$strand,
+coverage = TG_SA_significant_5hmc$coverage_bs,
+numCs = count_5hmc, # 5hmC counts
+numTs = count_non_5hmc # No-5hmC counts
+)
+# Vector de equivalencias
+new.chr.names <- c(
+"NC_005100.4" = "chr1",
+"NC_005101.4" = "chr2",
+"NC_005102.4" = "chr3",
+"NC_005103.4" = "chr4",
+"NC_005104.4" = "chr5",
+"NC_005105.4" = "chr6",
+"NC_005106.4" = "chr7",
+"NC_005107.4" = "chr8",
+"NC_005108.4" = "chr9",
+"NC_005109.4" = "chr10",
+"NC_005110.4" = "chr11",
+"NC_005111.4" = "chr12",
+"NC_005112.4" = "chr13",
+"NC_005113.4" = "chr14",
+"NC_005114.4" = "chr15",
+"NC_005115.4" = "chr16",
+"NC_005116.4" = "chr17",
+"NC_005117.4" = "chr18",
+"NC_005118.4" = "chr19",
+"NC_005119.4" = "chr20",
+"NC_005120.4" = "chrX",
+"NC_024475.1" = "chrY",
+"NC_001665.2" = "chrM"
+)
+# 1. Filtrar filas cuya columna chr empiece por "NC_"
+methyl_filtered_TG <- methyl_5hmc_TG[grep("^NC_", methyl_5hmc_TG$chr), ]
+# 2. Reemplazar los nombres según la tabla
+methyl_filtered_TG$chr <- new.chr.names[methyl_filtered_TG$chr]
+write.table(methyl_filtered_TG,
+file = "Galeano/methyl_filtered_TG.txt",
+sep = "\t",
+row.names = FALSE,
+col.names = FALSE,
+quote = FALSE)
+
+
+write.table(methyl_filtered_wt,
+file = "Galeano/methyl_filtered_WT.txt",
+sep = "\t",
+row.names = FALSE,
+col.names = FALSE,
+quote = FALSE)
+rutas (cámbialas si hace falta)
+tg_path <- "Galeano/methyl_filtered_TG.txt"
+wt_path <- "Galeano/methyl_filtered_WT.txt"
+
+como en el vignette: LISTA de archivos y sample.id como LISTA
+sample.id <- list("Tg","WT")
+treatment <- c(1, 0)
+file.list <- list(tg_path, wt_path)
+
+Crear objeto methylRaw para 5hmC
+myobj <- methRead(
+location = file.list,
+sample.id = sample.id,
+assembly = "rn6",
+treatment = treatment,
+context = "CpG",
+pipeline = "bismarkCytosineReport",
+mincov = 10)
+
